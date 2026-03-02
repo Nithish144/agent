@@ -1,0 +1,103 @@
+"""
+Tool Registry — Single source of truth for all allowed tools.
+The LLM can only select tools defined here.
+
+Each tool:
+- Has a description (shown to LLM in system prompt)
+- Has required_args (validated before execution)
+- Has allowed_args (safe value constraints)
+- Has an executor function in tools/executor.py
+"""
+
+TOOL_REGISTRY = {
+    # ── Installation Tools ──────────────────────────────────────────────────
+    "install_java": {
+        "description": "Install OpenJDK on the system.",
+        "required_args": ["version"],
+        "allowed_args": {"version": ["11", "17", "21"]},
+    },
+    "install_hadoop": {
+        "description": "Download and install Apache Hadoop.",
+        "required_args": ["version"],
+        "allowed_args": {"version": ["3.3.6", "3.4.0"]},
+    },
+
+    # ── Configuration Tools ─────────────────────────────────────────────────
+    "configure_java_home": {
+        "description": "Set JAVA_HOME environment variable in hadoop-env.sh.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "configure_hdfs_site": {
+        "description": "Update hdfs-site.xml with replication factor.",
+        "required_args": ["replication_factor"],
+        "allowed_args": {"replication_factor": [1, 2, 3]},
+    },
+    "configure_core_site": {
+        "description": "Update core-site.xml with NameNode URI.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+
+    # ── Lifecycle Tools ─────────────────────────────────────────────────────
+    "format_namenode": {
+        "description": "Format the NameNode (FIRST TIME ONLY — destructive if data exists).",
+        "required_args": ["human_approved"],
+        "allowed_args": {"human_approved": [True]},
+    },
+    "start_hdfs": {
+        "description": "Start HDFS (NameNode + DataNode).",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "stop_hdfs": {
+        "description": "Gracefully stop HDFS.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "restart_namenode": {
+        "description": "Restart only the NameNode process.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "restart_datanode": {
+        "description": "Restart only the DataNode process.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "leave_safemode": {
+        "description": "Force HDFS to leave safe mode.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+
+    # ── Health & Diagnostics Tools ──────────────────────────────────────────
+    "check_hdfs_health": {
+        "description": "Run hdfs dfsadmin -report and return status.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "analyze_logs": {
+        "description": "Scan Hadoop logs for recent ERROR/FATAL entries.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+    "check_disk_space": {
+        "description": "Check available disk space on the cluster.",
+        "required_args": [],
+        "allowed_args": {},
+    },
+
+    # ── Terminal Tool ───────────────────────────────────────────────────────
+    "request_human_approval": {
+        "description": "Pause the agent and request human approval before continuing.",
+        "required_args": ["reason"],
+        "allowed_args": {},
+    },
+}
+
+# Tools that require explicit human approval (never auto-executed)
+DESTRUCTIVE_TOOLS = {
+    "format_namenode",
+    "stop_hdfs",
+}
