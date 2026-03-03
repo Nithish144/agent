@@ -97,6 +97,17 @@ class HadoopAgent:
         """Main agent loop."""
         logger.info("🚀 Hadoop AI Agent starting...")
 
+        # Bootstrap: write HDFS daemon user vars to hadoop-env.sh so that
+        # start-dfs.sh / stop-dfs.sh work from any terminal without errors,
+        # even when the cluster is already healthy and start_hdfs is never
+        # called by the agent in this run.
+        # Uses getpwuid(getuid()) — correct user even when run under sudo,
+        # immune to SUDO_USER pointing to an unrelated account (e.g. kc-internal).
+        try:
+            self.tool_executor._write_daemon_users_to_hadoop_env()
+        except Exception as e:
+            logger.warning(f"Could not bootstrap daemon user vars: {e}")
+
         iteration = 0
         while iteration < self.max_iterations:
             iteration += 1
@@ -126,7 +137,7 @@ class HadoopAgent:
             decision = self.llm_reasoner.decide(
                 current_state,
                 gaps,
-                override_instruction=override_instruction,   # ← injected into prompt
+                override_instruction=override_instruction,
             )
             logger.info(f"🧠 LLM Decision: {json.dumps(decision, indent=2)}")
 
@@ -135,7 +146,7 @@ class HadoopAgent:
                 return {"status": "error", "reason": "invalid_llm_decision", "log": self.action_log}
 
             # Step 6: Hard-block: never let the LLM retry start_hdfs when an
-            # override is active — catch it even if the LLM ignores the prompt.
+            # override is active — catches it even if the LLM ignores the prompt.
             tool_name = decision["tool"]
             if override_instruction and tool_name == "start_hdfs":
                 logger.error(
