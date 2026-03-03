@@ -85,6 +85,31 @@ class StateDetector:
         )
         logger.info(f"Auto-set HADOOP_HOME={hadoop_home} and updated PATH")
 
+        # Create symlinks in /usr/local/bin for all key Hadoop commands.
+        # /usr/local/bin is on PATH for EVERY user, EVERY shell type, with NO
+        # sourcing required — this is the only reliable cross-user, cross-shell fix.
+        # .bashrc fixes only work after `source ~/.bashrc` in the current session.
+        HADOOP_COMMANDS = [
+            # sbin — cluster management scripts
+            "start-dfs.sh", "stop-dfs.sh", "start-yarn.sh", "stop-yarn.sh",
+            "start-all.sh", "stop-all.sh", "hadoop-daemon.sh", "hdfs-config.sh",
+            # bin — user-facing tools
+            "hadoop", "hdfs", "yarn", "mapred",
+        ]
+        for cmd in HADOOP_COMMANDS:
+            for subdir in ("sbin", "bin"):
+                src = os.path.join(hadoop_home, subdir, cmd)
+                dst = os.path.join("/usr/local/bin", cmd)
+                if os.path.isfile(src):
+                    try:
+                        if os.path.lexists(dst):
+                            os.remove(dst)
+                        os.symlink(src, dst)
+                        logger.info(f"Symlinked {cmd} → /usr/local/bin/")
+                    except Exception as e:
+                        logger.warning(f"Could not symlink {cmd}: {e}")
+                    break  # found in this subdir, no need to check the other
+
         # Persist to all shell init files so every terminal session works.
         # ~/.bashrc      — interactive non-login bash shells
         # ~/.bash_profile — login bash shells (SSH, new terminal tabs on some systems)
