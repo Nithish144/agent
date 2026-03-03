@@ -197,22 +197,71 @@ class ToolExecutor:
         self._update_xml_property(filepath, "fs.defaultFS", "hdfs://localhost:9000")
         return {"updated": filepath}
 
+    def _auto_detect_java_home(self) -> str:
+        """Always auto-detect JAVA_HOME from system — never rely on env variable."""
+        try:
+            java_bin = subprocess.run(["which", "java"], capture_output=True, text=True).stdout.strip()
+            if java_bin:
+                real = subprocess.run(["readlink", "-f", java_bin], capture_output=True, text=True).stdout.strip()
+                return os.path.dirname(os.path.dirname(real))
+        except Exception:
+            pass
+        # Fallback: search common locations
+        for candidate in [
+            "/usr/lib/jvm/java-11-openjdk-amd64",
+            "/usr/lib/jvm/java-11-openjdk-arm64",
+            "/usr/lib/jvm/temurin-11-amd64",
+            "/usr/lib/jvm/java-21-openjdk-amd64",
+        ]:
+            if os.path.isfile(os.path.join(candidate, "bin", "java")):
+                return candidate
+        return "/usr/lib/jvm/java-11-openjdk-amd64"
+
+    def _write_java_home_to_hadoop_env(self, java_home: str):
+        """Write JAVA_HOME into hadoop-env.sh so start-dfs.sh always finds it."""
+        env_file = os.path.join(HADOOP_HOME, "etc", "hadoop", "hadoop-env.sh")
+        if not os.path.exists(env_file):
+            logger.warning(f"hadoop-env.sh not found at {env_file}")
+            return
+        with open(env_file, "r") as f:
+            content = f.read()
+        # Remove old JAVA_HOME lines and add fresh one
+        import re
+        content = re.sub(r"\n?#?\s*export JAVA_HOME=.*", "", content)
+        content = content.rstrip() + f"\nexport JAVA_HOME={java_home}\n"
+        with open(env_file, "w") as f:
+            f.write(content)
+        logger.info(f"✅ Wrote JAVA_HOME={java_home} into hadoop-env.sh")
+
     def _start_hdfs(self, args: dict) -> dict:
-        # Format namenode if first time
-        namenode_dir = "/data/namenode"
-        namenode_current = os.path.join(namenode_dir, "current")
+        # Step 1: Auto-detect JAVA_HOME and write to hadoop-env.sh
+        java_home = self._auto_detect_java_home()
+        logger.info(f"Auto-detected JAVA_HOME: {java_home}")
+        self._write_java_home_to_hadoop_env(java_home)
+        os.environ["JAVA_HOME"] = java_home
+
+        # Step 2: Format NameNode if first time
+        namenode_current = "/tmp/hadoop-root/dfs/name/current"
         if not os.path.isdir(namenode_current):
             logger.info("Formatting NameNode for first time...")
-            fmt = self._run([os.path.join(HADOOP_HOME, "bin", "hdfs"), "namenode", "-format", "-force"], timeout=60)
-            logger.info(f"Format result: {fmt}")
+            env_fmt = os.environ.copy()
+            env_fmt["JAVA_HOME"] = java_home
+            fmt = subprocess.run(
+                [os.path.join(HADOOP_HOME, "bin", "hdfs"), "namenode", "-format", "-force"],
+                capture_output=True, text=True, timeout=60, env=env_fmt
+            )
+            logger.info(f"Format returncode: {fmt.returncode}")
 
+        # Step 3: Start HDFS with full env
         script = os.path.join(HADOOP_HOME, "sbin", "start-dfs.sh")
         env = os.environ.copy()
-        env["JAVA_HOME"] = env.get("JAVA_HOME", "/usr/lib/jvm/java-11-openjdk-amd64")
+        env["JAVA_HOME"] = java_home
+        env["HADOOP_HOME"] = HADOOP_HOME
+        env["PATH"] = java_home + "/bin:" + HADOOP_HOME + "/bin:" + env.get("PATH", "")
         env["HDFS_NAMENODE_USER"] = "root"
         env["HDFS_DATANODE_USER"] = "root"
         env["HDFS_SECONDARYNAMENODE_USER"] = "root"
-        result = subprocess.run([script], capture_output=True, text=True, timeout=60, env=env)
+        result = subprocess.run([script], capture_output=True, text=True, timeout=90, env=env)
         return {"returncode": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
 
     def _stop_hdfs(self, args: dict) -> dict:
