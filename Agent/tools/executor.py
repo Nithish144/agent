@@ -229,6 +229,8 @@ class ToolExecutor:
     # FIX 3: jps per-line matching — "NameNode" in string matched SecondaryNameNode.
     # FIX 4: 3-second startup delay — daemons are async; jps ran before they registered.
     # FIX 5: jps binary resolved via java_home — works even when jps not on PATH.
+    # FIX 6: Log harvesting on failure — surfaces actual crash reason from Hadoop logs
+    #         so the LLM agent can diagnose and fix instead of retrying blindly.
     # -------------------------------------------------------------------------
     def _start_hdfs(self, args: dict) -> dict:
         # Step 1: Auto-detect JAVA_HOME and write to hadoop-env.sh
@@ -273,6 +275,7 @@ class ToolExecutor:
                 "secondary_namenode_running": False,
                 "jps_output": "",
                 "ssh_ready": False,
+                "daemon_error": None,
                 "ssh_fix": (
                     "Run these commands to enable passwordless SSH:\n"
                     "  sudo apt install openssh-server -y\n"
@@ -321,7 +324,7 @@ class ToolExecutor:
 
         # Step 5: Wait for daemons — start-dfs.sh spawns them asynchronously.
         # Running jps immediately returns only 'Jps' even on success.
-        time.sleep(3)
+        time.sleep(5)
 
         # Step 6: Verify daemons via jps — exit code 0 from start-dfs.sh is NOT reliable.
         # Resolve jps explicitly; it may not be on PATH even when java is installed.
@@ -345,10 +348,16 @@ class ToolExecutor:
         datanode_running  = any(line.endswith("DataNode") for line in jps_lines)
         secondary_running = any(line.endswith("SecondaryNameNode") for line in jps_lines)
 
+        # Step 7: On failure, harvest the actual crash reason from Hadoop logs.
+        # Without this the LLM only sees "daemons not running" and retries forever.
+        daemon_error = None
         if not (namenode_running and datanode_running):
+            daemon_error = self._harvest_daemon_error(java_home)
             logger.error(
-                f"Daemons did not start.\njps output:\n{jps_output}\n"
-                f"start-dfs.sh stderr:\n{result.stderr.strip()}"
+                f"Daemons did not start.\n"
+                f"jps output:\n{jps_output}\n"
+                f"start-dfs.sh stderr:\n{result.stderr.strip()}\n"
+                f"Harvested error:\n{daemon_error}"
             )
 
         return {
@@ -360,7 +369,58 @@ class ToolExecutor:
             "secondary_namenode_running": secondary_running,
             "jps_output": jps_output.strip(),
             "ssh_ready": ssh_ok,
+            # Key field: if not None, the LLM must act on this instead of retrying start_hdfs
+            "daemon_error": daemon_error,
         }
+
+    def _harvest_daemon_error(self, java_home: str) -> str:
+        """
+        Read the last 40 lines of every Hadoop log file and return the most
+        recent ERROR/FATAL/Exception lines. Called only when daemons fail to start.
+        Gives the LLM agent a concrete error to act on instead of blind retrying.
+        """
+        log_dir = os.environ.get("HADOOP_LOG_DIR", os.path.join(HADOOP_HOME, "logs"))
+        # Also check the per-user tmp log location used by some Hadoop versions
+        alt_log_dir = f"/tmp/hadoop-{os.environ.get('USER', 'root')}/logs"
+
+        collected = []
+        for search_dir in [log_dir, alt_log_dir]:
+            if not os.path.isdir(search_dir):
+                continue
+            for fname in sorted(os.listdir(search_dir)):
+                if not (fname.endswith(".log") or fname.endswith(".out")):
+                    continue
+                fpath = os.path.join(search_dir, fname)
+                try:
+                    with open(fpath, "r", errors="ignore") as f:
+                        lines = f.readlines()[-40:]
+                    hits = [
+                        l.strip() for l in lines
+                        if any(kw in l for kw in ("ERROR", "FATAL", "Exception", "WARN"))
+                    ]
+                    if hits:
+                        collected.append(f"--- {fname} ---")
+                        collected.extend(hits[-10:])  # cap per-file to avoid flooding
+                except Exception:
+                    pass
+
+        if not collected:
+            # Fall back: show raw tail of namenode log if nothing matched
+            for search_dir in [log_dir, alt_log_dir]:
+                if not os.path.isdir(search_dir):
+                    continue
+                for fname in os.listdir(search_dir):
+                    if "namenode" in fname.lower() and fname.endswith(".log"):
+                        try:
+                            with open(os.path.join(search_dir, fname), "r", errors="ignore") as f:
+                                tail = f.readlines()[-20:]
+                            collected.append(f"--- {fname} (tail, no errors matched) ---")
+                            collected.extend(l.strip() for l in tail)
+                        except Exception:
+                            pass
+                        break
+
+        return "\n".join(collected) if collected else "No log files found in " + log_dir
 
     def _stop_hdfs(self, args: dict) -> dict:
         script = os.path.join(HADOOP_HOME, "sbin", "stop-dfs.sh")
