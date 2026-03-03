@@ -24,16 +24,24 @@ class LLMReasoner:
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/hadoop-ai-agent",  # optional, shows in OpenRouter dashboard
+            "HTTP-Referer": "https://github.com/hadoop-ai-agent",
             "X-Title": "Hadoop AI Agent",
         }
 
-    def decide(self, current_state: dict, gaps: list[dict]) -> dict | None:
+    def decide(
+        self,
+        current_state: dict,
+        gaps: list[dict],
+        override_instruction: str = None,
+    ) -> dict | None:
         """
         Ask Trinity Large Preview to decide which tool to call next.
         Returns parsed JSON decision or None on failure.
+
+        override_instruction: if provided, prepended to the user message as a
+        hard directive — used to break infinite loops when daemons fail to start.
         """
-        user_message = self._build_user_message(current_state, gaps)
+        user_message = self._build_user_message(current_state, gaps, override_instruction)
         logger.debug(f"Sending to LLM:\n{user_message}")
 
         payload = {
@@ -80,8 +88,19 @@ class LLMReasoner:
             logger.error(f"LLM returned invalid JSON: {e}\nRaw: {raw}")
             return None
 
-    def _build_user_message(self, current_state: dict, gaps: list[dict]) -> str:
-        return f"""CURRENT CLUSTER STATE:
+    def _build_user_message(
+        self,
+        current_state: dict,
+        gaps: list[dict],
+        override_instruction: str = None,
+    ) -> str:
+        override_block = ""
+        if override_instruction:
+            override_block = f"""⚠️  AGENT OVERRIDE — FOLLOW THIS BEFORE ANYTHING ELSE:
+{override_instruction}
+
+"""
+        return f"""{override_block}CURRENT CLUSTER STATE:
 {json.dumps(current_state, indent=2)}
 
 GAPS (not yet meeting goal):
