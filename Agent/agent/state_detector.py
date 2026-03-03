@@ -95,11 +95,39 @@ class StateDetector:
             f"export JAVA_HOME={os.environ.get('JAVA_HOME', '/usr/lib/jvm/java-11-openjdk-amd64')}",
             "export PATH=$PATH:$JAVA_HOME/bin",
         ]
-        shell_files = [
-            os.path.expanduser("~/.bashrc"),
-            os.path.expanduser("~/.bash_profile"),
-            os.path.expanduser("~/.profile"),
-        ]
+        # Detect ALL real human users to write to — agent may run as root
+        # but the terminal user is different (e.g. ubuntu, hadoop, ec2-user).
+        # Strategy: collect home dirs for (1) current user, (2) SUDO_USER if
+        # agent was launched with sudo, (3) all non-system users (UID >= 1000).
+        import pwd as _pwd
+        target_homes = set()
+
+        # Current process user
+        target_homes.add(os.path.expanduser("~"))
+
+        # SUDO_USER — the human who ran `sudo python main.py`
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            try:
+                target_homes.add(_pwd.getpwnam(sudo_user).pw_dir)
+            except KeyError:
+                pass
+
+        # All non-system users (UID >= 1000) — catches ubuntu, hadoop, etc.
+        try:
+            for entry in _pwd.getpwall():
+                if entry.pw_uid >= 1000 and os.path.isdir(entry.pw_dir):
+                    target_homes.add(entry.pw_dir)
+        except Exception:
+            pass
+
+        shell_files = []
+        for home in target_homes:
+            shell_files += [
+                os.path.join(home, ".bashrc"),
+                os.path.join(home, ".bash_profile"),
+                os.path.join(home, ".profile"),
+            ]
         for shell_file in shell_files:
             try:
                 # Read existing content (create file if missing)
@@ -108,11 +136,11 @@ class StateDetector:
                         content = f.read()
                 except FileNotFoundError:
                     content = ""
-                lines_to_add = [
-                    l for l in export_lines
-                    if l.split("=")[0].replace("export ", "") + "=" not in content
-                    and l not in content
-                ]
+                # Check each export line individually by its exact string —
+                # the old filter used variable-name matching which caused the
+                # PATH export to be skipped because PATH= already existed in
+                # .bashrc (from unrelated PATH=$PATH:/snap/bin lines).
+                lines_to_add = [l for l in export_lines if l not in content]
                 if lines_to_add:
                     with open(shell_file, "a") as f:
                         f.write("\n# Added by Hadoop AI Agent\n")
