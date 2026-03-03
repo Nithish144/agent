@@ -85,23 +85,54 @@ class StateDetector:
         )
         logger.info(f"Auto-set HADOOP_HOME={hadoop_home} and updated PATH")
 
-        # Persist to ~/.bashrc so terminal works without manual setup
-        bashrc = os.path.expanduser("~/.bashrc")
+        # Persist to all shell init files so every terminal session works.
+        # ~/.bashrc      — interactive non-login bash shells
+        # ~/.bash_profile — login bash shells (SSH, new terminal tabs on some systems)
+        # ~/.profile     — login shells (sh, dash, non-bash)
+        export_lines = [
+            f"export HADOOP_HOME={hadoop_home}",
+            "export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin",
+            f"export JAVA_HOME={os.environ.get('JAVA_HOME', '/usr/lib/jvm/java-11-openjdk-amd64')}",
+            "export PATH=$PATH:$JAVA_HOME/bin",
+        ]
+        shell_files = [
+            os.path.expanduser("~/.bashrc"),
+            os.path.expanduser("~/.bash_profile"),
+            os.path.expanduser("~/.profile"),
+        ]
+        for shell_file in shell_files:
+            try:
+                # Read existing content (create file if missing)
+                try:
+                    with open(shell_file, "r") as f:
+                        content = f.read()
+                except FileNotFoundError:
+                    content = ""
+                lines_to_add = [
+                    l for l in export_lines
+                    if l.split("=")[0].replace("export ", "") + "=" not in content
+                    and l not in content
+                ]
+                if lines_to_add:
+                    with open(shell_file, "a") as f:
+                        f.write("\n# Added by Hadoop AI Agent\n")
+                        f.write("\n".join(lines_to_add) + "\n")
+                    logger.info(f"Wrote Hadoop/Java PATH exports to {shell_file}")
+            except Exception as e:
+                logger.warning(f"Could not update {shell_file}: {e}")
+
+        # Also write /etc/environment for system-wide persistence (all users, all shells)
         try:
-            with open(bashrc, "r") as f:
-                content = f.read()
-            lines_to_add = []
-            if f"HADOOP_HOME={hadoop_home}" not in content:
-                lines_to_add.append(f"export HADOOP_HOME={hadoop_home}")
-            if "$HADOOP_HOME/bin" not in content:
-                lines_to_add.append("export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin")
-            if lines_to_add:
-                with open(bashrc, "a") as f:
-                    f.write("\n# Added by Hadoop AI Agent\n")
-                    f.write("\n".join(lines_to_add) + "\n")
-                logger.info(f"Wrote HADOOP_HOME and PATH to {bashrc}")
+            with open("/etc/environment", "r") as f:
+                etc_content = f.read()
+            with open("/etc/environment", "a") as f:
+                if f"HADOOP_HOME=" not in etc_content:
+                    f.write(f'\nHADOOP_HOME="{hadoop_home}"\n')
+                if f"JAVA_HOME=" not in etc_content:
+                    java_home_val = os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-11-openjdk-amd64")
+                    f.write(f'JAVA_HOME="{java_home_val}"\n')
         except Exception as e:
-            logger.warning(f"Could not update ~/.bashrc: {e}")
+            logger.warning(f"Could not update /etc/environment: {e}")
 
         return shutil.which("hadoop") is not None
 
@@ -206,19 +237,67 @@ class StateDetector:
 
     def _check_log_errors(self) -> bool:
         """
-        Check Hadoop logs for FATAL/ERROR entries written in the last 5 minutes only.
+        Check Hadoop logs for FATAL/ERROR entries written AFTER the NameNode started.
 
-        The old approach scanned the last 200 lines with no time filter — old errors
-        from failed startup attempts kept triggering this indefinitely, even after
-        the cluster was healthy. Now only recent lines count.
+        Strategy:
+        1. Find when the NameNode last started by reading its log for the
+           "NameNode RPC up" / "IPC Server Responder" startup marker.
+        2. Only flag ERROR/FATAL lines that appear AFTER that timestamp.
+
+        This prevents old startup-failure errors (from before core-site.xml was
+        fixed) from keeping critical_log_errors=true forever after the cluster
+        is healthy. Falls back to a 10-minute window if no startup marker found.
         """
         log_dirs = [
             os.path.join(HADOOP_HOME, "logs"),
             "/opt/hadoop/logs",
             os.environ.get("HADOOP_LOG_DIR", ""),
         ]
-        cutoff = datetime.now() - timedelta(minutes=5)
 
+        # Step 1: Find NameNode startup timestamp from its log
+        namenode_started_at = None
+        NAMENODE_MARKERS = (
+            "org.apache.hadoop.hdfs.server.namenode.NameNode: createNameNode",
+            "NameNode RPC up at:",
+            "IPC Server Responder",
+            "NameNode: registered UNIX signal handlers",
+        )
+        for log_dir in log_dirs:
+            if not log_dir or not os.path.isdir(log_dir):
+                continue
+            for fname in os.listdir(log_dir):
+                if "namenode" not in fname.lower() or not fname.endswith(".log"):
+                    continue
+                fpath = os.path.join(log_dir, fname)
+                try:
+                    with open(fpath, "r", errors="ignore") as f:
+                        lines = f.readlines()
+                    # Walk lines in reverse — find the MOST RECENT startup marker
+                    for line in reversed(lines):
+                        if any(m in line for m in NAMENODE_MARKERS):
+                            try:
+                                ts_str = line[:23]
+                                namenode_started_at = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f")
+                                break
+                            except ValueError:
+                                pass
+                    if namenode_started_at:
+                        break
+                except Exception:
+                    pass
+            if namenode_started_at:
+                break
+
+        # Step 2: Set cutoff — errors only count if after NameNode started
+        if namenode_started_at:
+            cutoff = namenode_started_at
+            logger.debug(f"Log error cutoff: NameNode started at {namenode_started_at}")
+        else:
+            # NameNode not running or log unreadable — fall back to 10-minute window
+            cutoff = datetime.now() - timedelta(minutes=10)
+            logger.debug("Log error cutoff: fallback 10-minute window")
+
+        # Step 3: Scan all logs for ERROR/FATAL after cutoff
         for log_dir in log_dirs:
             if not log_dir or not os.path.isdir(log_dir):
                 continue
@@ -228,19 +307,17 @@ class StateDetector:
                 fpath = os.path.join(log_dir, fname)
                 try:
                     with open(fpath, "r", errors="ignore") as f:
-                        lines = f.readlines()[-200:]
+                        lines = f.readlines()[-300:]
                     for line in lines:
                         if "FATAL" not in line and "ERROR" not in line:
                             continue
-                        # Parse Hadoop log timestamp: 2026-03-03 08:15:24,346
                         try:
                             ts_str = line[:23]
                             ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f")
                             if ts >= cutoff:
-                                logger.debug(f"Recent error in {fname}: {line.strip()[:120]}")
+                                logger.debug(f"Post-startup error in {fname}: {line.strip()[:120]}")
                                 return True
                         except ValueError:
-                            # Line has no parseable timestamp — skip it
                             pass
                 except Exception:
                     pass
