@@ -4,12 +4,17 @@ In production: runs actual shell commands / API checks.
 In simulation: returns mocked state for safe testing.
 """
 
+import os
 import subprocess
 import shutil
 import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+HADOOP_HOME = os.environ.get("HADOOP_HOME", "/usr/local/hadoop")
 
 
 class StateDetector:
@@ -60,31 +65,46 @@ class StateDetector:
         return None
 
     def _check_java_home(self) -> bool:
-        import os
         java_home = os.environ.get("JAVA_HOME", "")
-        return bool(java_home) and shutil.which(f"{java_home}/bin/java") is not None
+        return bool(java_home) and os.path.isfile(os.path.join(java_home, "bin", "java"))
 
     def _check_process(self, process_name: str) -> bool:
+        """
+        Per-line exact suffix match — avoids 'NameNode' matching 'SecondaryNameNode'.
+        """
         try:
             result = subprocess.run(
                 ["jps"], capture_output=True, text=True, timeout=5
             )
-            return process_name in result.stdout
+            return any(
+                line.strip().endswith(process_name)
+                for line in result.stdout.splitlines()
+            )
         except Exception:
             return False
 
     def _get_replication_factor(self) -> Optional[int]:
+        """
+        Read replication factor directly from hdfs-site.xml.
+
+        The old approach used `hdfs dfsadmin -report` which only returns
+        replication data when live blocks exist — always null on a fresh cluster.
+        Reading the config file is instant, reliable, and works before any data
+        is written to HDFS.
+        """
+        xml_path = os.path.join(HADOOP_HOME, "etc", "hadoop", "hdfs-site.xml")
         try:
-            result = subprocess.run(
-                ["hdfs", "dfsadmin", "-report"], capture_output=True, text=True, timeout=10
-            )
-            for line in result.stdout.splitlines():
-                if "Replication" in line:
-                    parts = line.split(":")
-                    if len(parts) > 1:
-                        return int(parts[1].strip())
-        except Exception:
-            pass
+            if os.path.exists(xml_path):
+                tree = ET.parse(xml_path)
+                root = tree.getroot()
+                for prop in root.findall("property"):
+                    name_el = prop.find("name")
+                    if name_el is not None and name_el.text == "dfs.replication":
+                        value_el = prop.find("value")
+                        if value_el is not None and value_el.text:
+                            return int(value_el.text.strip())
+        except Exception as e:
+            logger.warning(f"Could not read replication factor from {xml_path}: {e}")
         return None
 
     def _check_safemode(self) -> bool:
@@ -98,13 +118,20 @@ class StateDetector:
             return False
 
     def _check_log_errors(self) -> bool:
-        """Check Hadoop logs for FATAL/ERROR entries."""
-        import os
+        """
+        Check Hadoop logs for FATAL/ERROR entries written in the last 5 minutes only.
+
+        The old approach scanned the last 200 lines with no time filter — old errors
+        from failed startup attempts kept triggering this indefinitely, even after
+        the cluster was healthy. Now only recent lines count.
+        """
         log_dirs = [
-            "/usr/local/hadoop/logs",
+            os.path.join(HADOOP_HOME, "logs"),
             "/opt/hadoop/logs",
             os.environ.get("HADOOP_LOG_DIR", ""),
         ]
+        cutoff = datetime.now() - timedelta(minutes=5)
+
         for log_dir in log_dirs:
             if not log_dir or not os.path.isdir(log_dir):
                 continue
@@ -114,11 +141,20 @@ class StateDetector:
                 fpath = os.path.join(log_dir, fname)
                 try:
                     with open(fpath, "r", errors="ignore") as f:
-                        # Check last 200 lines only
                         lines = f.readlines()[-200:]
                     for line in lines:
-                        if "FATAL" in line or "ERROR" in line:
-                            return True
+                        if "FATAL" not in line and "ERROR" not in line:
+                            continue
+                        # Parse Hadoop log timestamp: 2026-03-03 08:15:24,346
+                        try:
+                            ts_str = line[:23]
+                            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f")
+                            if ts >= cutoff:
+                                logger.debug(f"Recent error in {fname}: {line.strip()[:120]}")
+                                return True
+                        except ValueError:
+                            # Line has no parseable timestamp — skip it
+                            pass
                 except Exception:
                     pass
         return False
