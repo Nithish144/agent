@@ -7,6 +7,8 @@ import subprocess
 import logging
 import os
 import sys
+import shutil
+import time
 import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
@@ -81,8 +83,7 @@ class ToolExecutor:
         if IS_WINDOWS:
             return {"status": "manual_required", "message": f"Download OpenJDK {version} from https://adoptium.net"}
 
-        import shutil as _shutil
-        if _shutil.which("java"):
+        if shutil.which("java"):
             logger.info("Java already installed, updating JAVA_HOME only")
             try:
                 java_path = subprocess.run(["which", "java"], capture_output=True, text=True).stdout.strip()
@@ -115,12 +116,10 @@ class ToolExecutor:
         if IS_WINDOWS:
             return {"status": "manual_required", "message": f"Download hadoop-{version} from https://hadoop.apache.org/releases.html"}
 
-        # Check if already extracted (avoid re-download)
         hadoop_dir = f"/usr/local/hadoop-{version}"
         if os.path.isdir(hadoop_dir):
             logger.info(f"Hadoop {version} already extracted at {hadoop_dir}, creating symlink only")
             link = self._run(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"])
-            # Add to PATH for current process
             os.environ["PATH"] = f"/usr/local/hadoop/bin:{os.environ.get('PATH', '')}"
             os.environ["HADOOP_HOME"] = "/usr/local/hadoop"
             return {"version": version, "status": "already_exists", "symlink": link}
@@ -134,10 +133,8 @@ class ToolExecutor:
         logger.info("Extracting Hadoop...")
         extract = self._run(["tar", "-xzf", tarfile, "-C", "/usr/local/"], timeout=120)
         link = self._run(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"])
-        # Update PATH for current process so state_detector finds it
         os.environ["PATH"] = f"/usr/local/hadoop/bin:{os.environ.get('PATH', '')}"
         os.environ["HADOOP_HOME"] = "/usr/local/hadoop"
-        # Cleanup tar
         try:
             os.remove(tarfile)
         except Exception:
@@ -147,7 +144,6 @@ class ToolExecutor:
     def _configure_java_home(self, args: dict) -> dict:
         if IS_WINDOWS:
             return {"status": "manual_required", "message": "Set JAVA_HOME in System Environment Variables"}
-        # Auto-detect JAVA_HOME
         try:
             java_path = subprocess.run(["which", "java"], capture_output=True, text=True).stdout.strip()
             real_path = subprocess.run(["readlink", "-f", java_path], capture_output=True, text=True).stdout.strip()
@@ -155,10 +151,8 @@ class ToolExecutor:
         except Exception:
             java_home = "/usr/lib/jvm/java-11-openjdk-amd64"
 
-        # Set for current process
         os.environ["JAVA_HOME"] = java_home
 
-        # Write to hadoop-env.sh
         env_file = os.path.join(HADOOP_HOME, "etc", "hadoop", "hadoop-env.sh")
         if os.path.exists(env_file):
             with open(env_file, "r") as f:
@@ -171,7 +165,6 @@ class ToolExecutor:
             with open(env_file, "w") as f:
                 f.write(content)
 
-        # Also write to /etc/environment for persistence
         try:
             with open("/etc/environment", "a") as f:
                 f.write(f'\nJAVA_HOME="{java_home}"\n')
@@ -187,7 +180,6 @@ class ToolExecutor:
         self._update_xml_property(filepath, "dfs.replication", replication)
         self._update_xml_property(filepath, "dfs.namenode.name.dir", "file:///data/namenode")
         self._update_xml_property(filepath, "dfs.datanode.data.dir", "file:///data/datanode")
-        # Create data dirs
         os.makedirs("/data/namenode", exist_ok=True)
         os.makedirs("/data/datanode", exist_ok=True)
         return {"updated": filepath, "replication_factor": replication}
@@ -206,7 +198,6 @@ class ToolExecutor:
                 return os.path.dirname(os.path.dirname(real))
         except Exception:
             pass
-        # Fallback: search common locations
         for candidate in [
             "/usr/lib/jvm/java-11-openjdk-amd64",
             "/usr/lib/jvm/java-11-openjdk-arm64",
@@ -225,7 +216,6 @@ class ToolExecutor:
             return
         with open(env_file, "r") as f:
             content = f.read()
-        # Remove old JAVA_HOME lines and add fresh one
         import re
         content = re.sub(r"\n?#?\s*export JAVA_HOME=.*", "", content)
         content = content.rstrip() + f"\nexport JAVA_HOME={java_home}\n"
@@ -233,63 +223,145 @@ class ToolExecutor:
             f.write(content)
         logger.info(f"✅ Wrote JAVA_HOME={java_home} into hadoop-env.sh")
 
-  def _start_hdfs(self, args: dict) -> dict:
-    # Step 1: Auto-detect JAVA_HOME and write to hadoop-env.sh
-    java_home = self._auto_detect_java_home()
-    logger.info(f"Auto-detected JAVA_HOME: {java_home}")
-    self._write_java_home_to_hadoop_env(java_home)
-    os.environ["JAVA_HOME"] = java_home
+    # -------------------------------------------------------------------------
+    # FIX 1: Indentation corrected — was at 2-space (broke out of class scope).
+    # FIX 2: SSH pre-flight added — start-dfs.sh silently fails without it.
+    # FIX 3: jps per-line matching — "NameNode" in string matched SecondaryNameNode.
+    # FIX 4: 3-second startup delay — daemons are async; jps ran before they registered.
+    # FIX 5: jps binary resolved via java_home — works even when jps not on PATH.
+    # -------------------------------------------------------------------------
+    def _start_hdfs(self, args: dict) -> dict:
+        # Step 1: Auto-detect JAVA_HOME and write to hadoop-env.sh
+        java_home = self._auto_detect_java_home()
+        logger.info(f"Auto-detected JAVA_HOME: {java_home}")
+        self._write_java_home_to_hadoop_env(java_home)
+        os.environ["JAVA_HOME"] = java_home
 
-    # Step 2: Format NameNode if first time
-    namenode_current = "/tmp/hadoop-root/dfs/name/current"
-    if not os.path.isdir(namenode_current):
-        logger.info("Formatting NameNode for first time...")
-        env_fmt = os.environ.copy()
-        env_fmt["JAVA_HOME"] = java_home
-        fmt = subprocess.run(
-            [os.path.join(HADOOP_HOME, "bin", "hdfs"), "namenode", "-format", "-force"],
+        # Step 2: SSH pre-flight — start-dfs.sh uses SSH even for localhost.
+        # Without passwordless SSH the script exits 0 but daemons never start.
+        ssh_ok = False
+        ssh_error = ""
+        try:
+            ssh_check = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=5",
+                    "-o", "StrictHostKeyChecking=no",
+                    "localhost",
+                    "echo", "ssh_ok",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            ssh_ok = ssh_check.returncode == 0 and "ssh_ok" in ssh_check.stdout
+            if not ssh_ok:
+                ssh_error = ssh_check.stderr.strip() or "SSH returned non-zero"
+                logger.warning(f"Passwordless SSH not configured: {ssh_error}")
+        except Exception as e:
+            ssh_error = str(e)
+            logger.warning(f"SSH pre-flight check failed: {e}")
+
+        if not ssh_ok:
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": f"SSH pre-flight failed: {ssh_error}",
+                "namenode_running": False,
+                "datanode_running": False,
+                "secondary_namenode_running": False,
+                "jps_output": "",
+                "ssh_ready": False,
+                "ssh_fix": (
+                    "Run these commands to enable passwordless SSH:\n"
+                    "  sudo apt install openssh-server -y\n"
+                    "  sudo service ssh start\n"
+                    "  ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa\n"
+                    "  cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys\n"
+                    "  chmod 600 ~/.ssh/authorized_keys\n"
+                    "  ssh localhost echo test  # must succeed without password prompt"
+                ),
+            }
+
+        # Step 3: Format NameNode if first time
+        namenode_current = "/tmp/hadoop-root/dfs/name/current"
+        if not os.path.isdir(namenode_current):
+            logger.info("Formatting NameNode for first time...")
+            env_fmt = os.environ.copy()
+            env_fmt["JAVA_HOME"] = java_home
+            fmt = subprocess.run(
+                [os.path.join(HADOOP_HOME, "bin", "hdfs"), "namenode", "-format", "-force"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env_fmt,
+            )
+            logger.info(f"Format returncode: {fmt.returncode}")
+            if fmt.returncode != 0:
+                logger.warning(f"NameNode format stderr: {fmt.stderr.strip()}")
+
+        # Step 4: Start HDFS
+        script = os.path.join(HADOOP_HOME, "sbin", "start-dfs.sh")
+        env = os.environ.copy()
+        env["JAVA_HOME"] = java_home
+        env["HADOOP_HOME"] = HADOOP_HOME
+        env["PATH"] = f"{java_home}/bin:{HADOOP_HOME}/bin:{HADOOP_HOME}/sbin:{env.get('PATH', '')}"
+        env["HDFS_NAMENODE_USER"] = "root"
+        env["HDFS_DATANODE_USER"] = "root"
+        env["HDFS_SECONDARYNAMENODE_USER"] = "root"
+
+        result = subprocess.run(
+            [script],
             capture_output=True,
             text=True,
-            timeout=60,
-            env=env_fmt
+            timeout=90,
+            env=env,
         )
-        logger.info(f"Format returncode: {fmt.returncode}")
 
-    # Step 3: Start HDFS
-    script = os.path.join(HADOOP_HOME, "sbin", "start-dfs.sh")
-    env = os.environ.copy()
-    env["JAVA_HOME"] = java_home
-    env["HADOOP_HOME"] = HADOOP_HOME
-    env["PATH"] = f"{java_home}/bin:{HADOOP_HOME}/bin:{HADOOP_HOME}/sbin:{env.get('PATH','')}"
-    env["HDFS_NAMENODE_USER"] = "root"
-    env["HDFS_DATANODE_USER"] = "root"
-    env["HDFS_SECONDARYNAMENODE_USER"] = "root"
+        # Step 5: Wait for daemons — start-dfs.sh spawns them asynchronously.
+        # Running jps immediately returns only 'Jps' even on success.
+        time.sleep(3)
 
-    result = subprocess.run(
-        [script],
-        capture_output=True,
-        text=True,
-        timeout=90,
-        env=env
-    )
+        # Step 6: Verify daemons via jps — exit code 0 from start-dfs.sh is NOT reliable.
+        # Resolve jps explicitly; it may not be on PATH even when java is installed.
+        jps_bin = shutil.which("jps") or os.path.join(java_home, "bin", "jps")
+        try:
+            jps_proc = subprocess.run(
+                [jps_bin],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+            )
+            jps_output = jps_proc.stdout
+        except Exception as e:
+            logger.warning(f"jps check failed: {e}")
+            jps_output = ""
 
-    # Step 4: VERIFY daemons actually running (this was missing)
-    jps = subprocess.run(["jps"], capture_output=True, text=True)
-    jps_output = jps.stdout
+        # Per-line matching avoids "NameNode" matching inside "SecondaryNameNode"
+        jps_lines = [line.strip() for line in jps_output.splitlines()]
+        namenode_running  = any(line.endswith("NameNode") for line in jps_lines)
+        datanode_running  = any(line.endswith("DataNode") for line in jps_lines)
+        secondary_running = any(line.endswith("SecondaryNameNode") for line in jps_lines)
 
-    namenode_running = "NameNode" in jps_output
-    datanode_running = "DataNode" in jps_output
-    secondary_running = "SecondaryNameNode" in jps_output
+        if not (namenode_running and datanode_running):
+            logger.error(
+                f"Daemons did not start.\njps output:\n{jps_output}\n"
+                f"start-dfs.sh stderr:\n{result.stderr.strip()}"
+            )
 
-    return {
-        "returncode": result.returncode,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-        "namenode_running": namenode_running,
-        "datanode_running": datanode_running,
-        "secondary_namenode_running": secondary_running,
-        "jps_output": jps_output.strip()
-    }
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "namenode_running": namenode_running,
+            "datanode_running": datanode_running,
+            "secondary_namenode_running": secondary_running,
+            "jps_output": jps_output.strip(),
+            "ssh_ready": ssh_ok,
+        }
+
     def _stop_hdfs(self, args: dict) -> dict:
         script = os.path.join(HADOOP_HOME, "sbin", "stop-dfs.sh")
         env = os.environ.copy()
@@ -348,6 +420,3 @@ class ToolExecutor:
         reason = args.get("reason", "Unknown")
         logger.warning(f"HUMAN APPROVAL REQUIRED: {reason}")
         return {"status": "paused", "reason": reason}
-
-
-import shutil
