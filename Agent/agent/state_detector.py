@@ -49,10 +49,67 @@ class StateDetector:
             pass
         return None
 
-    def _check_hadoop(self) -> bool:
+
+    def _ensure_hadoop_on_path(self) -> bool:
+        """
+        Ensure HADOOP_HOME and its bin/sbin are on PATH.
+        Checks in order:
+        1. hadoop already on PATH (nothing to do)
+        2. /usr/local/hadoop symlink (standard install location)
+        3. Any /usr/local/hadoop-* versioned directory
+
+        When found, sets HADOOP_HOME and PATH for the current process so every
+        subsequent subprocess (hadoop, hdfs, start-dfs.sh) finds the binaries.
+        Also writes to ~/.bashrc so the terminal works without manual setup.
+        """
+        # Already on PATH — nothing to do
+        if shutil.which("hadoop"):
+            return True
+
+        # Find Hadoop home directory
+        hadoop_home = None
+        import glob as _glob
+        candidates = ["/usr/local/hadoop"] + sorted(_glob.glob("/usr/local/hadoop-*"), reverse=True)
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(candidate, "bin", "hadoop")):
+                hadoop_home = candidate
+                break
+
+        if not hadoop_home:
+            return False
+
+        # Set for current process
+        os.environ["HADOOP_HOME"] = hadoop_home
+        os.environ["PATH"] = (
+            f"{hadoop_home}/bin:{hadoop_home}/sbin:{os.environ.get('PATH', '')}"
+        )
+        logger.info(f"Auto-set HADOOP_HOME={hadoop_home} and updated PATH")
+
+        # Persist to ~/.bashrc so terminal works without manual setup
+        bashrc = os.path.expanduser("~/.bashrc")
+        try:
+            with open(bashrc, "r") as f:
+                content = f.read()
+            lines_to_add = []
+            if f"HADOOP_HOME={hadoop_home}" not in content:
+                lines_to_add.append(f"export HADOOP_HOME={hadoop_home}")
+            if "$HADOOP_HOME/bin" not in content:
+                lines_to_add.append("export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin")
+            if lines_to_add:
+                with open(bashrc, "a") as f:
+                    f.write("\n# Added by Hadoop AI Agent\n")
+                    f.write("\n".join(lines_to_add) + "\n")
+                logger.info(f"Wrote HADOOP_HOME and PATH to {bashrc}")
+        except Exception as e:
+            logger.warning(f"Could not update ~/.bashrc: {e}")
+
         return shutil.which("hadoop") is not None
 
+    def _check_hadoop(self) -> bool:
+        return self._ensure_hadoop_on_path()
+
     def _get_hadoop_version(self) -> Optional[str]:
+        self._ensure_hadoop_on_path()
         try:
             result = subprocess.run(
                 ["hadoop", "version"], capture_output=True, text=True, timeout=5
@@ -64,9 +121,39 @@ class StateDetector:
             pass
         return None
 
+
     def _check_java_home(self) -> bool:
-        java_home = os.environ.get("JAVA_HOME", "")
-        return bool(java_home) and os.path.isfile(os.path.join(java_home, "bin", "java"))
+        """
+        Check JAVA_HOME from two sources in order:
+        1. Current process environment (set by shell or configure_java_home)
+        2. hadoop-env.sh (written by configure_java_home — persists across runs)
+
+        Using only os.environ means the agent sees java_home_configured=false
+        on every fresh run even after it was already configured, causing it to
+        call configure_java_home unnecessarily every single time.
+        """
+        # Source 1: environment variable
+        java_home = os.environ.get("JAVA_HOME", "").strip()
+        if java_home and os.path.isfile(os.path.join(java_home, "bin", "java")):
+            return True
+
+        # Source 2: hadoop-env.sh (persistent across agent restarts)
+        env_file = os.path.join(HADOOP_HOME, "etc", "hadoop", "hadoop-env.sh")
+        try:
+            if os.path.exists(env_file):
+                with open(env_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("export JAVA_HOME="):
+                            java_home = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if java_home and os.path.isfile(os.path.join(java_home, "bin", "java")):
+                                # Sync into current process so subprocesses inherit it
+                                os.environ["JAVA_HOME"] = java_home
+                                return True
+        except Exception as e:
+            logger.warning(f"Could not read hadoop-env.sh: {e}")
+
+        return False
 
     def _check_process(self, process_name: str) -> bool:
         """
