@@ -210,18 +210,62 @@ class ToolExecutor:
 
     def _write_java_home_to_hadoop_env(self, java_home: str):
         """Write JAVA_HOME into hadoop-env.sh so start-dfs.sh always finds it."""
+        import re
         env_file = os.path.join(HADOOP_HOME, "etc", "hadoop", "hadoop-env.sh")
         if not os.path.exists(env_file):
             logger.warning(f"hadoop-env.sh not found at {env_file}")
             return
         with open(env_file, "r") as f:
             content = f.read()
-        import re
         content = re.sub(r"\n?#?\s*export JAVA_HOME=.*", "", content)
         content = content.rstrip() + f"\nexport JAVA_HOME={java_home}\n"
         with open(env_file, "w") as f:
             f.write(content)
-        logger.info(f"✅ Wrote JAVA_HOME={java_home} into hadoop-env.sh")
+        logger.info(f"Wrote JAVA_HOME={java_home} into hadoop-env.sh")
+
+    def _write_daemon_users_to_hadoop_env(self):
+        """
+        Persist HDFS daemon user env vars into hadoop-env.sh.
+
+        Hadoop's start-dfs.sh requires HDFS_NAMENODE_USER,
+        HDFS_DATANODE_USER, and HDFS_SECONDARYNAMENODE_USER to be defined
+        when running as root, otherwise it prints:
+            ERROR: Attempting to operate on hdfs namenode as root
+            ERROR: but there is no HDFS_NAMENODE_USER defined. Aborting operation.
+
+        Writing these into hadoop-env.sh makes start-dfs.sh work silently
+        from any terminal session, not just when the agent sets them at runtime.
+        """
+        env_file = os.path.join(HADOOP_HOME, "etc", "hadoop", "hadoop-env.sh")
+        if not os.path.exists(env_file):
+            logger.warning(f"hadoop-env.sh not found at {env_file}, skipping daemon user config")
+            return
+
+        with open(env_file, "r") as f:
+            content = f.read()
+
+        # Use the actual running user — works whether agent runs as root or ubuntu
+        current_user = os.environ.get("SUDO_USER") or os.environ.get("USER", "root")
+
+        daemon_vars = {
+            "HDFS_NAMENODE_USER": current_user,
+            "HDFS_DATANODE_USER": current_user,
+            "HDFS_SECONDARYNAMENODE_USER": current_user,
+        }
+
+        lines_to_add = [
+            f"export {k}={v}"
+            for k, v in daemon_vars.items()
+            if f"export {k}=" not in content
+        ]
+
+        if lines_to_add:
+            with open(env_file, "a") as f:
+                f.write("\n# Added by Hadoop AI Agent — required to run HDFS daemons\n")
+                f.write("\n".join(lines_to_add) + "\n")
+            logger.info(f"Wrote HDFS daemon user vars to hadoop-env.sh (user={current_user})")
+        else:
+            logger.debug("HDFS daemon user vars already present in hadoop-env.sh")
 
     # -------------------------------------------------------------------------
     # FIX 1: Indentation corrected — was at 2-space (broke out of class scope).
@@ -231,12 +275,15 @@ class ToolExecutor:
     # FIX 5: jps binary resolved via java_home — works even when jps not on PATH.
     # FIX 6: Log harvesting on failure — surfaces actual crash reason from Hadoop logs
     #         so the LLM agent can diagnose and fix instead of retrying blindly.
+    # FIX 7: Daemon user vars written to hadoop-env.sh — eliminates root errors from
+    #         manual terminal usage (HDFS_NAMENODE_USER / DATANODE / SECONDARYNAMENODE).
     # -------------------------------------------------------------------------
     def _start_hdfs(self, args: dict) -> dict:
         # Step 1: Auto-detect JAVA_HOME and write to hadoop-env.sh
         java_home = self._auto_detect_java_home()
         logger.info(f"Auto-detected JAVA_HOME: {java_home}")
         self._write_java_home_to_hadoop_env(java_home)
+        self._write_daemon_users_to_hadoop_env()  # FIX 7: persist daemon user vars
         os.environ["JAVA_HOME"] = java_home
 
         # Step 2: SSH pre-flight — start-dfs.sh uses SSH even for localhost.
@@ -310,9 +357,9 @@ class ToolExecutor:
         env["JAVA_HOME"] = java_home
         env["HADOOP_HOME"] = HADOOP_HOME
         env["PATH"] = f"{java_home}/bin:{HADOOP_HOME}/bin:{HADOOP_HOME}/sbin:{env.get('PATH', '')}"
-        env["HDFS_NAMENODE_USER"] = "root"
-        env["HDFS_DATANODE_USER"] = "root"
-        env["HDFS_SECONDARYNAMENODE_USER"] = "root"
+        env["HDFS_NAMENODE_USER"] = os.environ.get("SUDO_USER") or os.environ.get("USER", "root")
+        env["HDFS_DATANODE_USER"] = env["HDFS_NAMENODE_USER"]
+        env["HDFS_SECONDARYNAMENODE_USER"] = env["HDFS_NAMENODE_USER"]
 
         result = subprocess.run(
             [script],
@@ -380,7 +427,6 @@ class ToolExecutor:
         Gives the LLM agent a concrete error to act on instead of blind retrying.
         """
         log_dir = os.environ.get("HADOOP_LOG_DIR", os.path.join(HADOOP_HOME, "logs"))
-        # Also check the per-user tmp log location used by some Hadoop versions
         alt_log_dir = f"/tmp/hadoop-{os.environ.get('USER', 'root')}/logs"
 
         collected = []
@@ -400,12 +446,11 @@ class ToolExecutor:
                     ]
                     if hits:
                         collected.append(f"--- {fname} ---")
-                        collected.extend(hits[-10:])  # cap per-file to avoid flooding
+                        collected.extend(hits[-10:])
                 except Exception:
                     pass
 
         if not collected:
-            # Fall back: show raw tail of namenode log if nothing matched
             for search_dir in [log_dir, alt_log_dir]:
                 if not os.path.isdir(search_dir):
                     continue
@@ -424,10 +469,11 @@ class ToolExecutor:
 
     def _stop_hdfs(self, args: dict) -> dict:
         script = os.path.join(HADOOP_HOME, "sbin", "stop-dfs.sh")
+        current_user = os.environ.get("SUDO_USER") or os.environ.get("USER", "root")
         env = os.environ.copy()
-        env["HDFS_NAMENODE_USER"] = "root"
-        env["HDFS_DATANODE_USER"] = "root"
-        env["HDFS_SECONDARYNAMENODE_USER"] = "root"
+        env["HDFS_NAMENODE_USER"] = current_user
+        env["HDFS_DATANODE_USER"] = current_user
+        env["HDFS_SECONDARYNAMENODE_USER"] = current_user
         result = subprocess.run([script], capture_output=True, text=True, timeout=60, env=env)
         return {"returncode": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
 
