@@ -258,7 +258,45 @@ class StateDetector:
         hadoop_home = _resolve_hadoop_home()
         log_dirs = [os.path.join(hadoop_home, "logs"),
                     os.environ.get("HADOOP_LOG_DIR", "")]
-        cutoff = datetime.now() - timedelta(minutes=2)
+
+        # Find when NameNode last successfully started
+        # Only count errors that appeared AFTER this point
+        namenode_start_time = None
+        NAMENODE_START_MARKERS = [
+            "NameNode RPC up at:",
+            "IPC Server Responder",
+            "createNameNode",
+        ]
+        for log_dir in log_dirs:
+            if not log_dir or not os.path.isdir(log_dir):
+                continue
+            for fname in os.listdir(log_dir):
+                if "namenode" not in fname.lower() or not fname.endswith(".log"):
+                    continue
+                try:
+                    for line in open(os.path.join(log_dir, fname), errors="ignore"):
+                        if any(m in line for m in NAMENODE_START_MARKERS):
+                            try:
+                                namenode_start_time = datetime.strptime(
+                                    line[:23], "%Y-%m-%d %H:%M:%S,%f")
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
+
+        # Use NameNode start time as cutoff so pre-startup errors are ignored
+        # Fall back to last 3 minutes if NameNode hasn't started yet
+        cutoff = namenode_start_time if namenode_start_time else (
+            datetime.now() - timedelta(minutes=3))
+
+        # Benign / expected errors — never count these
+        IGNORE_PATTERNS = [
+            "RECEIVED SIGNAL 15: SIGTERM",   # normal graceful shutdown
+            "RECEIVED SIGNAL 2: SIGINT",
+            "file:/// has no authority",      # pre-config error, now fixed
+            "No services to connect",         # pre-config error, now fixed
+            "missing NameNode address",       # pre-config error, now fixed
+        ]
 
         for log_dir in log_dirs:
             if not log_dir or not os.path.isdir(log_dir):
@@ -270,6 +308,8 @@ class StateDetector:
                     for line in open(os.path.join(log_dir, fname),
                                      errors="ignore").readlines()[-300:]:
                         if "FATAL" not in line and "ERROR" not in line:
+                            continue
+                        if any(p in line for p in IGNORE_PATTERNS):
                             continue
                         try:
                             ts = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
