@@ -258,7 +258,7 @@ class StateDetector:
         hadoop_home = _resolve_hadoop_home()
         log_dirs = [os.path.join(hadoop_home, "logs"),
                     os.environ.get("HADOOP_LOG_DIR", "")]
-        cutoff = datetime.now() - timedelta(minutes=10)
+        cutoff = datetime.now() - timedelta(minutes=2)
 
         for log_dir in log_dirs:
             if not log_dir or not os.path.isdir(log_dir):
