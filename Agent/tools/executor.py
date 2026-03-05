@@ -157,14 +157,32 @@ class ToolExecutor:
             f"export YARN_NODEMANAGER_USER={user}\n"
         )
         try:
-            open(profile_file, "w").write(content)
-            os.chmod(profile_file, 0o644)
+            if os.getuid() == 0:
+                open(profile_file, "w").write(content)
+                os.chmod(profile_file, 0o644)
+            else:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False)
+                tmp.write(content)
+                tmp.flush()
+                tmp.close()
+                subprocess.run(["sudo", "-n", "cp", tmp.name, profile_file], check=True)
+                subprocess.run(["sudo", "-n", "chmod", "644", profile_file], check=True)
+                os.unlink(tmp.name)
             logger.info(f"Wrote {profile_file}")
         except Exception as e:
             logger.warning(f"Could not write {profile_file}: {e}")
 
         source_line = f"\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}\n"
-        for bashrc in {os.path.expanduser("~/.bashrc"), "/home/ubuntu/.bashrc", "/root/.bashrc"}:
+        import pwd as _pwd
+        bashrc_files = {os.path.expanduser("~/.bashrc")}
+        try:
+            for entry in _pwd.getpwall():
+                if entry.pw_uid >= 1000 and os.path.isdir(entry.pw_dir):
+                    bashrc_files.add(os.path.join(entry.pw_dir, ".bashrc"))
+        except Exception:
+            pass
+        for bashrc in bashrc_files:
             try:
                 try:
                     existing = open(bashrc).read()
@@ -174,7 +192,16 @@ class ToolExecutor:
                     open(bashrc, "a").write(source_line)
                     logger.info(f"Patched {bashrc}")
             except Exception as e:
-                logger.warning(f"Could not patch {bashrc}: {e}")
+                # Try sudo for protected files
+                try:
+                    result = subprocess.run(
+                        ["sudo", "-n", "bash", "-c",
+                         f"grep -q '{profile_file}' {bashrc} 2>/dev/null || echo '\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}' >> {bashrc}"],
+                        capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        logger.info(f"Patched {bashrc} via sudo")
+                except Exception:
+                    logger.warning(f"Could not patch {bashrc}: {e}")
 
     def execute(self, tool_name: str, arguments: dict) -> dict:
         if tool_name not in self._dispatch:
@@ -187,6 +214,10 @@ class ToolExecutor:
             logger.error(f"Tool error [{tool_name}]: {e}")
             return {"success": False, "error": str(e)}
 
+    def _sudo(self, cmd: list) -> list:
+        """Prepend sudo -n if not already running as root."""
+        return cmd if os.getuid() == 0 else ["sudo", "-n"] + cmd
+
     def _install_java(self, args: dict) -> dict:
         version = args["version"]
         if IS_WINDOWS:
@@ -195,12 +226,14 @@ class ToolExecutor:
             java_home = _resolve_java_home()
             os.environ["JAVA_HOME"] = java_home
             return {"installed": "java (already present)", "returncode": 0, "stdout": "", "stderr": ""}
-        self._run(["apt-get", "update", "-qq"], timeout=120)
-        result = self._run(["apt-get", "install", "-y", f"openjdk-{version}-jdk"], timeout=300)
+        self._run(self._sudo(["apt-get", "update", "-qq"]), timeout=120)
+        result = self._run(self._sudo(["apt-get", "install", "-y", f"openjdk-{version}-jdk"]), timeout=300)
         if result["returncode"] == 0:
             java_home = _resolve_java_home()
             os.environ["JAVA_HOME"] = java_home
             os.environ["PATH"] = java_home + "/bin:" + os.environ.get("PATH", "")
+        else:
+            logger.error(f"Java install failed (rc={result['returncode']}): {result['stderr']}")
         return {"installed": f"openjdk-{version}-jdk", **result}
 
     def _install_hadoop(self, args: dict) -> dict:
@@ -209,17 +242,31 @@ class ToolExecutor:
             return {"status": "manual_required"}
         hadoop_dir = f"/usr/local/hadoop-{version}"
         if os.path.isdir(hadoop_dir):
-            self._run(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"])
+            self._run(self._sudo(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"]))
             os.environ["HADOOP_HOME"] = hadoop_dir
             os.environ["PATH"] = f"{hadoop_dir}/bin:{hadoop_dir}/sbin:{os.environ.get('PATH','')}"
             return {"version": version, "status": "already_exists"}
-        url = f"https://downloads.apache.org/hadoop/common/hadoop-{version}/hadoop-{version}.tar.gz"
+        # Try multiple mirrors in order — fallback if one fails
+        mirrors = [
+            f"https://archive.apache.org/dist/hadoop/common/hadoop-{version}/hadoop-{version}.tar.gz",
+            f"https://downloads.apache.org/hadoop/common/hadoop-{version}/hadoop-{version}.tar.gz",
+        ]
         tarfile = f"/tmp/hadoop-{version}.tar.gz"
-        dl = self._run(["wget", "-q", "--show-progress", "-O", tarfile, url], timeout=600)
+        dl = {"returncode": 1, "stdout": "", "stderr": "no mirrors tried"}
+        for url in mirrors:
+            logger.info(f"Downloading Hadoop from {url} ...")
+            dl = self._run(
+                ["wget", "--continue", "--tries=3", "--timeout=60",
+                 "--show-progress", "-O", tarfile, url],
+                timeout=3600  # 1 hour max — resumes if interrupted
+            )
+            if dl["returncode"] == 0:
+                break
+            logger.warning(f"Mirror failed: {url} — trying next mirror")
         if dl["returncode"] != 0:
             return {"error": "Download failed", **dl}
-        extract = self._run(["tar", "-xzf", tarfile, "-C", "/usr/local/"], timeout=120)
-        self._run(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"])
+        extract = self._run(self._sudo(["tar", "-xzf", tarfile, "-C", "/usr/local/"]), timeout=120)
+        self._run(self._sudo(["ln", "-sfn", hadoop_dir, "/usr/local/hadoop"]))
         os.environ["HADOOP_HOME"] = hadoop_dir
         os.environ["PATH"] = f"{hadoop_dir}/bin:{hadoop_dir}/sbin:{os.environ.get('PATH','')}"
         try:
@@ -263,7 +310,7 @@ class ToolExecutor:
         os.environ["JAVA_HOME"]   = java_home
         os.environ["HADOOP_HOME"] = hadoop_home
 
-        # SSH pre-flight
+        # SSH pre-flight — auto-fix if not ready
         try:
             chk = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -274,16 +321,46 @@ class ToolExecutor:
             ssh_ok = False
 
         if not ssh_ok:
+            logger.info("SSH not ready — auto-fixing SSH...")
+            try:
+                self._run(self._sudo(["apt-get", "install", "-y", "openssh-server"]), timeout=120)
+                self._run(self._sudo(["service", "ssh", "start"]), timeout=30)
+                ssh_dir = os.path.expanduser("~/.ssh")
+                os.makedirs(ssh_dir, exist_ok=True)
+                os.chmod(ssh_dir, 0o700)
+                id_rsa = os.path.join(ssh_dir, "id_rsa")
+                if not os.path.isfile(id_rsa):
+                    subprocess.run(
+                        ["ssh-keygen", "-t", "rsa", "-P", "", "-f", id_rsa],
+                        capture_output=True, text=True, timeout=15)
+                pub_key_file = id_rsa + ".pub"
+                auth_keys = os.path.join(ssh_dir, "authorized_keys")
+                if os.path.isfile(pub_key_file):
+                    pub_key = open(pub_key_file).read().strip()
+                    existing = open(auth_keys).read() if os.path.isfile(auth_keys) else ""
+                    if pub_key not in existing:
+                        open(auth_keys, "a").write(pub_key + "\n")
+                if os.path.isfile(auth_keys):
+                    os.chmod(auth_keys, 0o600)
+                time.sleep(2)
+                chk2 = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                     "-o", "StrictHostKeyChecking=no", "localhost", "echo", "ssh_ok"],
+                    capture_output=True, text=True, timeout=10)
+                ssh_ok = chk2.returncode == 0 and "ssh_ok" in chk2.stdout
+                logger.info(f"SSH auto-fix done: ssh_ok={ssh_ok}")
+            except Exception as e:
+                logger.error(f"SSH auto-fix error: {e}")
+
+        if not ssh_ok:
             return {
-                "returncode": 1, "stdout": "", "stderr": "SSH pre-flight failed",
+                "returncode": 1, "stdout": "", "stderr": "SSH auto-fix failed",
                 "namenode_running": False, "datanode_running": False,
                 "secondary_namenode_running": False, "jps_output": "",
-                "ssh_ready": False, "daemon_error": None,
-                "ssh_fix": ("sudo apt install openssh-server -y && sudo service ssh start\n"
-                            "ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa\n"
-                            "cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys\n"
-                            "chmod 600 ~/.ssh/authorized_keys"),
+                "ssh_ready": False,
+                "daemon_error": "SSH could not be configured. Run manually: sudo apt install openssh-server -y && sudo service ssh start",
             }
+
 
         # Format NameNode if first time
         if not os.path.isdir("/tmp/hadoop-root/dfs/name/current"):
