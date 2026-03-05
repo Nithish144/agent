@@ -1,0 +1,74 @@
+"""
+Tool Validator — Safety layer that validates every LLM tool decision
+before execution. Blocks destructive or unknown operations.
+"""
+import logging
+from tools.registry import TOOL_REGISTRY, DESTRUCTIVE_TOOLS
+
+logger = logging.getLogger(__name__)
+
+
+class ToolValidator:
+
+    def validate(self, decision: dict) -> tuple[bool, str]:
+        """
+        Returns (is_valid, reason).
+        Blocks unknown tools, destructive tools, malformed decisions.
+        """
+        tool = decision.get("tool")
+        arguments = decision.get("arguments", {}) or {}
+
+        # Must have a tool name
+        if not tool:
+            return False, "No tool specified in decision."
+
+        # Tool must be in registry
+        if tool not in TOOL_REGISTRY:
+            return False, f"Unknown tool: '{tool}'. Not in registry."
+
+        # Block destructive tools (require human to stop agent manually)
+        if tool in DESTRUCTIVE_TOOLS:
+            return False, (
+                f"Tool '{tool}' is destructive and requires explicit human approval. "
+                "Stop the agent and run this manually if intended."
+            )
+
+        # Check required arguments — case-insensitive key matching
+        tool_def = TOOL_REGISTRY[tool]
+        required_args = tool_def.get("required_args", [])
+        # Build a case-insensitive lookup of provided args
+        args_lower = {k.lower(): k for k in arguments}
+        for arg in required_args:
+            if arg.lower() not in args_lower:
+                return False, f"Tool '{tool}' missing required argument: '{arg}'."
+
+        # Validate argument values
+        valid, msg = self._validate_args(tool, arguments, tool_def)
+        if not valid:
+            return False, msg
+
+        return True, "OK"
+
+    def _validate_args(self, tool: str, arguments: dict,
+                       tool_def: dict) -> tuple[bool, str]:
+        """Validate argument values against allowed values — case-insensitive keys."""
+        allowed = tool_def.get("allowed_args", {})
+        # Build case-insensitive map of allowed keys
+        allowed_lower = {k.lower(): (k, v) for k, v in allowed.items()}
+
+        for arg_key, value in arguments.items():
+            key_lower = arg_key.lower()
+            if key_lower in allowed_lower:
+                original_key, allowed_values = allowed_lower[key_lower]
+                # Normalize value for comparison — accept bool True and string "true"
+                norm_value = str(value).lower() if isinstance(value, str) else value
+                norm_allowed = [
+                    str(v).lower() if isinstance(v, str) else v
+                    for v in allowed_values
+                ]
+                if norm_value not in norm_allowed and value not in allowed_values:
+                    return False, (
+                        f"Argument '{arg_key}={value}' not allowed for tool '{tool}'. "
+                        f"Allowed: {allowed_values}"
+                    )
+        return True, "OK"
