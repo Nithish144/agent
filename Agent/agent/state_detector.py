@@ -110,8 +110,19 @@ class StateDetector:
         )
 
         try:
-            open(profile_file, "w").write(content)
-            os.chmod(profile_file, 0o644)
+            if os.getuid() == 0:
+                open(profile_file, "w").write(content)
+                os.chmod(profile_file, 0o644)
+            else:
+                # Write via sudo tee
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False)
+                tmp.write(content)
+                tmp.flush()
+                tmp.close()
+                subprocess.run(["sudo", "-n", "cp", tmp.name, profile_file], check=True)
+                subprocess.run(["sudo", "-n", "chmod", "644", profile_file], check=True)
+                os.unlink(tmp.name)
             logger.info(f"Wrote {profile_file} (HADOOP_HOME={hadoop_home})")
         except Exception as e:
             logger.warning(f"Could not write {profile_file}: {e}")
@@ -148,7 +159,15 @@ class StateDetector:
                     open(bashrc, "a").write(source_line)
                     logger.info(f"Patched {bashrc}")
             except Exception as e:
-                logger.warning(f"Could not patch {bashrc}: {e}")
+                try:
+                    subprocess.run(
+                        ["sudo", "-n", "bash", "-c",
+                         f"grep -q '{profile_file}' {bashrc} 2>/dev/null || "
+                         f"echo '\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}' >> {bashrc}"],
+                        capture_output=True, text=True, timeout=10)
+                    logger.info(f"Patched {bashrc} via sudo")
+                except Exception:
+                    logger.warning(f"Could not patch {bashrc}: {e}")
 
     def _create_bin_symlinks(self, hadoop_home: str):
         """Symlink hadoop/hdfs/yarn/mapred into /usr/local/bin (safe — no relative paths)."""
@@ -161,8 +180,14 @@ class StateDetector:
                 if os.path.islink(dst) or os.path.exists(dst):
                     if os.path.realpath(dst) == os.path.realpath(src):
                         continue
-                    os.remove(dst)
-                os.symlink(src, dst)
+                    if os.getuid() == 0:
+                        os.remove(dst)
+                    else:
+                        subprocess.run(["sudo", "-n", "rm", "-f", dst], check=True)
+                if os.getuid() == 0:
+                    os.symlink(src, dst)
+                else:
+                    subprocess.run(["sudo", "-n", "ln", "-sf", src, dst], check=True)
                 logger.info(f"Symlinked {cmd} → /usr/local/bin/")
             except Exception as e:
                 logger.warning(f"Could not symlink {cmd}: {e}")
