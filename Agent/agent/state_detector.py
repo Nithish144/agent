@@ -16,6 +16,15 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 HADOOP_BIN_SYMLINKS = ["hadoop", "hdfs", "yarn", "mapred"]
+# sbin scripts that must also be reachable from PATH directly
+HADOOP_SBIN_SYMLINKS = [
+    "start-dfs.sh", "stop-dfs.sh",
+    "start-yarn.sh", "stop-yarn.sh",
+    "start-all.sh", "stop-all.sh",
+    "hadoop-daemon.sh", "hadoop-daemons.sh",
+    "workers.sh", "refresh-namenodes.sh",
+    "mr-jobhistory-daemon.sh",
+]
 
 
 def _resolve_hadoop_home() -> str:
@@ -66,11 +75,41 @@ class StateDetector:
     # ── java ──────────────────────────────────────────────────────────────────
 
     def _check_java(self) -> bool:
-        return shutil.which("java") is not None
+        # Must actually RUN java — file existing is not enough (partial installs)
+        java_candidates = [
+            shutil.which("java"),
+            "/usr/bin/java",
+            "/usr/lib/jvm/java-11-openjdk-amd64/bin/java",
+            "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+            "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
+        ]
+        for p in java_candidates:
+            if not p:
+                continue
+            if not (os.path.isfile(p) or os.path.islink(p)):
+                continue
+            try:
+                # Actually execute java — if it runs, it is installed
+                rc = subprocess.run(
+                    [p, "-version"],
+                    capture_output=True, text=True, timeout=10
+                ).returncode
+                if rc == 0:
+                    real = os.path.realpath(p)
+                    java_home = os.path.dirname(os.path.dirname(real))
+                    os.environ["JAVA_HOME"] = java_home
+                    bin_dir = os.path.dirname(p)
+                    if bin_dir not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = bin_dir + ":" + os.environ.get("PATH", "")
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _get_java_version(self) -> Optional[str]:
         try:
-            out = subprocess.run(["java", "-version"], capture_output=True,
+            java_bin = shutil.which("java") or "/usr/lib/jvm/java-11-openjdk-amd64/bin/java"
+            out = subprocess.run([java_bin, "-version"], capture_output=True,
                                  text=True, timeout=5).stderr
             if '"' in out:
                 return out.split('"')[1]
@@ -88,11 +127,6 @@ class StateDetector:
             return "root"
 
     def _write_profile_d(self, hadoop_home: str, java_home: str):
-        """
-        Write /etc/profile.d/hadoop.sh with HADOOP_HOME, JAVA_HOME, sbin PATH,
-        and all daemon user vars.  Also patches .bashrc on all user homes so
-        non-login interactive terminals (Ubuntu default) pick it up too.
-        """
         import pwd as _pwd
         profile_file = "/etc/profile.d/hadoop.sh"
         user = self._get_current_user()
@@ -114,7 +148,6 @@ class StateDetector:
                 open(profile_file, "w").write(content)
                 os.chmod(profile_file, 0o644)
             else:
-                # Write via sudo tee
                 import tempfile
                 tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False)
                 tmp.write(content)
@@ -127,7 +160,6 @@ class StateDetector:
         except Exception as e:
             logger.warning(f"Could not write {profile_file}: {e}")
 
-        # Immediately set in current process
         for key, val in [
             ("HADOOP_HOME", hadoop_home), ("JAVA_HOME", java_home),
             ("HDFS_NAMENODE_USER", user), ("HDFS_DATANODE_USER", user),
@@ -138,10 +170,28 @@ class StateDetector:
         if hadoop_home + "/sbin" not in os.environ.get("PATH", ""):
             os.environ["PATH"] = f"{hadoop_home}/bin:{hadoop_home}/sbin:{os.environ.get('PATH','')}"
 
-        # Patch .bashrc on every real user home
+        # Write /etc/environment — sets PATH for ALL session types (SSH, sudo, non-login)
+        try:
+            env_file = "/etc/environment"
+            env_line = (
+                f'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+                f':{hadoop_home}/bin:{hadoop_home}/sbin:{java_home}/bin"'
+            )
+            existing_env = open(env_file).read() if os.path.exists(env_file) else ""
+            if "PATH=" in existing_env:
+                new_env = "\n".join(
+                    env_line if line.startswith("PATH=") else line
+                    for line in existing_env.splitlines()
+                ) + "\n"
+            else:
+                new_env = existing_env.rstrip() + "\n" + env_line + "\n"
+            open(env_file, "w").write(new_env)
+            logger.info("Wrote /etc/environment with Hadoop PATH")
+        except Exception as e:
+            logger.warning(f"Could not write /etc/environment: {e}")
+
         source_line = f"\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}\n"
-        homes = {os.path.expanduser("~"), "/root/.bashrc".replace("/.bashrc", ""),
-                 "/home/ubuntu"}
+        homes = {os.path.expanduser("~"), "/root", "/home/ubuntu"}
         try:
             for entry in _pwd.getpwall():
                 if entry.pw_uid >= 1000 and os.path.isdir(entry.pw_dir):
@@ -151,10 +201,7 @@ class StateDetector:
         for home in homes:
             bashrc = os.path.join(home, ".bashrc")
             try:
-                try:
-                    existing = open(bashrc).read()
-                except FileNotFoundError:
-                    existing = ""
+                existing = open(bashrc).read() if os.path.isfile(bashrc) else ""
                 if profile_file not in existing:
                     open(bashrc, "a").write(source_line)
                     logger.info(f"Patched {bashrc}")
@@ -163,17 +210,33 @@ class StateDetector:
                     subprocess.run(
                         ["sudo", "-n", "bash", "-c",
                          f"grep -q '{profile_file}' {bashrc} 2>/dev/null || "
-                         f"echo '\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}' >> {bashrc}"],
+                         f"echo '\\n# Hadoop AI Agent\\n[ -f {profile_file} ] && source {profile_file}' >> {bashrc}"],
                         capture_output=True, text=True, timeout=10)
                     logger.info(f"Patched {bashrc} via sudo")
                 except Exception:
                     logger.warning(f"Could not patch {bashrc}: {e}")
 
     def _create_bin_symlinks(self, hadoop_home: str):
-        """Symlink hadoop/hdfs/yarn/mapred into /usr/local/bin (safe — no relative paths)."""
-        for cmd in HADOOP_BIN_SYMLINKS:
-            src = os.path.join(hadoop_home, "bin", cmd)
-            dst = f"/usr/local/bin/{cmd}"
+        # bin commands (hadoop, hdfs, yarn, mapred)
+        symlink_pairs = [
+            (os.path.join(hadoop_home, "bin", cmd), f"/usr/local/bin/{cmd}")
+            for cmd in HADOOP_BIN_SYMLINKS
+        ]
+        # sbin scripts (stop-dfs.sh, start-dfs.sh, etc.)
+        symlink_pairs += [
+            (os.path.join(hadoop_home, "sbin", cmd), f"/usr/local/bin/{cmd}")
+            for cmd in HADOOP_SBIN_SYMLINKS
+        ]
+        # Also auto-discover everything in sbin to catch any we missed
+        sbin_dir = os.path.join(hadoop_home, "sbin")
+        if os.path.isdir(sbin_dir):
+            for fname in os.listdir(sbin_dir):
+                src = os.path.join(sbin_dir, fname)
+                dst = f"/usr/local/bin/{fname}"
+                if os.path.isfile(src) and (src, dst) not in symlink_pairs:
+                    symlink_pairs.append((src, dst))
+
+        for src, dst in symlink_pairs:
             if not os.path.isfile(src):
                 continue
             try:
@@ -188,26 +251,20 @@ class StateDetector:
                     os.symlink(src, dst)
                 else:
                     subprocess.run(["sudo", "-n", "ln", "-sf", src, dst], check=True)
-                logger.info(f"Symlinked {cmd} → /usr/local/bin/")
+                logger.info(f"Symlinked {os.path.basename(src)} -> /usr/local/bin/")
             except Exception as e:
-                logger.warning(f"Could not symlink {cmd}: {e}")
+                logger.warning(f"Could not symlink {os.path.basename(src)}: {e}")
 
     def _ensure_hadoop_on_path(self) -> bool:
-        """
-        Resolve HADOOP_HOME, set env vars, write profile.d, create symlinks.
-        Called on every collect() — fully self-healing and idempotent.
-        """
         hadoop_home = _resolve_hadoop_home()
         if not os.path.isfile(os.path.join(hadoop_home, "bin", "hadoop")):
             return False
-
         java_home = _resolve_java_home()
         os.environ["HADOOP_HOME"] = hadoop_home
         os.environ["JAVA_HOME"]   = java_home
         if hadoop_home + "/bin" not in os.environ.get("PATH", ""):
             os.environ["PATH"] = f"{hadoop_home}/bin:{hadoop_home}/sbin:{os.environ.get('PATH','')}"
             logger.info(f"Auto-set HADOOP_HOME={hadoop_home} and updated PATH")
-
         self._write_profile_d(hadoop_home, java_home)
         self._create_bin_symlinks(hadoop_home)
         return shutil.which("hadoop") is not None
@@ -217,11 +274,34 @@ class StateDetector:
 
     def _get_hadoop_version(self) -> Optional[str]:
         self._ensure_hadoop_on_path()
+        hadoop_home = _resolve_hadoop_home()
         try:
-            out = subprocess.run(["hadoop", "version"], capture_output=True,
-                                 text=True, timeout=5).stdout
-            if out:
-                return out.splitlines()[0].split()[-1]
+            hadoop_bin = os.path.join(hadoop_home, "bin", "hadoop")
+            out = subprocess.run(
+                [hadoop_bin, "version"],
+                capture_output=True, text=True, timeout=10,
+                env={**os.environ, "JAVA_HOME": _resolve_java_home(), "HADOOP_HOME": hadoop_home}
+            ).stdout
+            for line in out.splitlines():
+                if line.strip().startswith("Hadoop "):
+                    return line.strip().split()[-1]
+        except Exception:
+            pass
+        try:
+            common_dir = os.path.join(hadoop_home, "share", "hadoop", "common")
+            if os.path.isdir(common_dir):
+                for fname in os.listdir(common_dir):
+                    if fname.startswith("hadoop-common-") and fname.endswith(".jar"):
+                        ver = fname.replace("hadoop-common-", "").replace(".jar", "")
+                        if ver:
+                            return ver
+        except Exception:
+            pass
+        try:
+            import re as _re
+            m = _re.search(r"hadoop-(\d+\.\d+\.\d+)", hadoop_home)
+            if m:
+                return m.group(1)
         except Exception:
             pass
         return None
@@ -230,7 +310,6 @@ class StateDetector:
         java_home = os.environ.get("JAVA_HOME", "").strip()
         if java_home and os.path.isfile(os.path.join(java_home, "bin", "java")):
             return True
-        # Try reading from hadoop-env.sh
         env_file = os.path.join(_resolve_hadoop_home(), "etc", "hadoop", "hadoop-env.sh")
         try:
             for line in open(env_file):
@@ -244,16 +323,22 @@ class StateDetector:
             pass
         return False
 
-    # ── processes ────────────────────────────────────────────────────────────
+    # ── processes ─────────────────────────────────────────────────────────────
 
     def _check_process(self, process_name: str) -> bool:
-        try:
-            out = subprocess.run(["jps"], capture_output=True, text=True, timeout=5).stdout
-            return any(l.strip().endswith(process_name) for l in out.splitlines())
-        except Exception:
-            return False
+        for attempt in range(2):
+            try:
+                out = subprocess.run(["jps"], capture_output=True, text=True, timeout=10).stdout
+                if any(l.strip().endswith(process_name) for l in out.splitlines()):
+                    return True
+                if attempt == 0:
+                    import time as _time
+                    _time.sleep(2)
+            except Exception:
+                pass
+        return False
 
-    # ── config ───────────────────────────────────────────────────────────────
+    # ── config ────────────────────────────────────────────────────────────────
 
     def _get_replication_factor(self) -> Optional[int]:
         xml_path = os.path.join(_resolve_hadoop_home(), "etc", "hadoop", "hdfs-site.xml")
@@ -277,15 +362,12 @@ class StateDetector:
         except Exception:
             return False
 
-    # ── logs ─────────────────────────────────────────────────────────────────
+    # ── logs ──────────────────────────────────────────────────────────────────
 
     def _check_log_errors(self) -> bool:
         hadoop_home = _resolve_hadoop_home()
         log_dirs = [os.path.join(hadoop_home, "logs"),
                     os.environ.get("HADOOP_LOG_DIR", "")]
-
-        # Find when NameNode last successfully started
-        # Only count errors that appeared AFTER this point
         namenode_start_time = None
         NAMENODE_START_MARKERS = [
             "NameNode RPC up at:",
@@ -302,27 +384,19 @@ class StateDetector:
                     for line in open(os.path.join(log_dir, fname), errors="ignore"):
                         if any(m in line for m in NAMENODE_START_MARKERS):
                             try:
-                                namenode_start_time = datetime.strptime(
-                                    line[:23], "%Y-%m-%d %H:%M:%S,%f")
+                                namenode_start_time = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
                             except ValueError:
                                 pass
                 except Exception:
                     pass
-
-        # Use NameNode start time as cutoff so pre-startup errors are ignored
-        # Fall back to last 3 minutes if NameNode hasn't started yet
-        cutoff = namenode_start_time if namenode_start_time else (
-            datetime.now() - timedelta(minutes=3))
-
-        # Benign / expected errors — never count these
+        cutoff = namenode_start_time if namenode_start_time else (datetime.now() - timedelta(minutes=3))
         IGNORE_PATTERNS = [
-            "RECEIVED SIGNAL 15: SIGTERM",   # normal graceful shutdown
+            "RECEIVED SIGNAL 15: SIGTERM",
             "RECEIVED SIGNAL 2: SIGINT",
-            "file:/// has no authority",      # pre-config error, now fixed
-            "No services to connect",         # pre-config error, now fixed
-            "missing NameNode address",       # pre-config error, now fixed
+            "file:/// has no authority",
+            "No services to connect",
+            "missing NameNode address",
         ]
-
         for log_dir in log_dirs:
             if not log_dir or not os.path.isdir(log_dir):
                 continue
@@ -330,8 +404,7 @@ class StateDetector:
                 if not fname.endswith(".log"):
                     continue
                 try:
-                    for line in open(os.path.join(log_dir, fname),
-                                     errors="ignore").readlines()[-300:]:
+                    for line in open(os.path.join(log_dir, fname), errors="ignore").readlines()[-300:]:
                         if "FATAL" not in line and "ERROR" not in line:
                             continue
                         if any(p in line for p in IGNORE_PATTERNS):
@@ -346,7 +419,7 @@ class StateDetector:
                     pass
         return False
 
-    # ── disk ─────────────────────────────────────────────────────────────────
+    # ── disk ──────────────────────────────────────────────────────────────────
 
     def _get_disk_usage(self) -> Optional[int]:
         try:
