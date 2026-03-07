@@ -16,14 +16,13 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 HADOOP_BIN_SYMLINKS = ["hadoop", "hdfs", "yarn", "mapred"]
-# sbin scripts that must also be reachable from PATH directly
 HADOOP_SBIN_SYMLINKS = [
-    "start-dfs.sh", "stop-dfs.sh",
-    "start-yarn.sh", "stop-yarn.sh",
-    "start-all.sh", "stop-all.sh",
-    "hadoop-daemon.sh", "hadoop-daemons.sh",
-    "workers.sh", "refresh-namenodes.sh",
-    "mr-jobhistory-daemon.sh",
+    "start-dfs.sh", "stop-dfs.sh", "start-yarn.sh", "stop-yarn.sh",
+    "start-all.sh", "stop-all.sh", "hadoop-daemon.sh", "hadoop-daemons.sh",
+    "workers.sh", "refresh-namenodes.sh", "mr-jobhistory-daemon.sh",
+    "yarn-daemon.sh", "yarn-daemons.sh", "httpfs.sh", "kms.sh",
+    "start-balancer.sh", "stop-balancer.sh", "distribute-exclude.sh",
+    "start-secure-dns.sh", "stop-secure-dns.sh",
 ]
 
 
@@ -170,26 +169,6 @@ class StateDetector:
         if hadoop_home + "/sbin" not in os.environ.get("PATH", ""):
             os.environ["PATH"] = f"{hadoop_home}/bin:{hadoop_home}/sbin:{os.environ.get('PATH','')}"
 
-        # Write /etc/environment — sets PATH for ALL session types (SSH, sudo, non-login)
-        try:
-            env_file = "/etc/environment"
-            env_line = (
-                f'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-                f':{hadoop_home}/bin:{hadoop_home}/sbin:{java_home}/bin"'
-            )
-            existing_env = open(env_file).read() if os.path.exists(env_file) else ""
-            if "PATH=" in existing_env:
-                new_env = "\n".join(
-                    env_line if line.startswith("PATH=") else line
-                    for line in existing_env.splitlines()
-                ) + "\n"
-            else:
-                new_env = existing_env.rstrip() + "\n" + env_line + "\n"
-            open(env_file, "w").write(new_env)
-            logger.info("Wrote /etc/environment with Hadoop PATH")
-        except Exception as e:
-            logger.warning(f"Could not write /etc/environment: {e}")
-
         source_line = f"\n# Hadoop AI Agent\n[ -f {profile_file} ] && source {profile_file}\n"
         homes = {os.path.expanduser("~"), "/root", "/home/ubuntu"}
         try:
@@ -216,44 +195,43 @@ class StateDetector:
                 except Exception:
                     logger.warning(f"Could not patch {bashrc}: {e}")
 
-    def _create_bin_symlinks(self, hadoop_home: str):
-        # bin commands (hadoop, hdfs, yarn, mapred)
-        symlink_pairs = [
-            (os.path.join(hadoop_home, "bin", cmd), f"/usr/local/bin/{cmd}")
-            for cmd in HADOOP_BIN_SYMLINKS
-        ]
-        # sbin scripts (stop-dfs.sh, start-dfs.sh, etc.)
-        symlink_pairs += [
-            (os.path.join(hadoop_home, "sbin", cmd), f"/usr/local/bin/{cmd}")
-            for cmd in HADOOP_SBIN_SYMLINKS
-        ]
-        # Also auto-discover everything in sbin to catch any we missed
-        sbin_dir = os.path.join(hadoop_home, "sbin")
-        if os.path.isdir(sbin_dir):
-            for fname in os.listdir(sbin_dir):
-                src = os.path.join(sbin_dir, fname)
-                dst = f"/usr/local/bin/{fname}"
-                if os.path.isfile(src) and (src, dst) not in symlink_pairs:
-                    symlink_pairs.append((src, dst))
+    def _sudo_ln(self, src: str, dst: str, name: str):
+        """Symlink src -> dst using sudo ln -sfn (works for both root and non-root)."""
+        try:
+            cmd = ["sudo", "-n", "ln", "-sfn", src, dst] if os.getuid() != 0 else ["ln", "-sfn", src, dst]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                logger.info(f"Symlinked {name} -> /usr/local/bin/")
+            else:
+                logger.warning(f"Could not symlink {name}: {r.stderr.strip()}")
+        except Exception as e:
+            logger.warning(f"Could not symlink {name}: {e}")
 
-        for src, dst in symlink_pairs:
+    def _create_bin_symlinks(self, hadoop_home: str):
+        # bin/ commands
+        for cmd in HADOOP_BIN_SYMLINKS:
+            src = os.path.join(hadoop_home, "bin", cmd)
             if not os.path.isfile(src):
                 continue
-            try:
-                if os.path.islink(dst) or os.path.exists(dst):
-                    if os.path.realpath(dst) == os.path.realpath(src):
-                        continue
-                    if os.getuid() == 0:
-                        os.remove(dst)
-                    else:
-                        subprocess.run(["sudo", "-n", "rm", "-f", dst], check=True)
-                if os.getuid() == 0:
-                    os.symlink(src, dst)
-                else:
-                    subprocess.run(["sudo", "-n", "ln", "-sf", src, dst], check=True)
-                logger.info(f"Symlinked {os.path.basename(src)} -> /usr/local/bin/")
-            except Exception as e:
-                logger.warning(f"Could not symlink {os.path.basename(src)}: {e}")
+            dst = f"/usr/local/bin/{cmd}"
+            # skip if already pointing to same target
+            if os.path.islink(dst) and os.path.realpath(dst) == os.path.realpath(src):
+                continue
+            self._sudo_ln(src, dst, cmd)
+
+        # sbin/ scripts — explicit list + auto-discover anything else
+        sbin_dir = os.path.join(hadoop_home, "sbin")
+        sbin_names = set(HADOOP_SBIN_SYMLINKS)
+        if os.path.isdir(sbin_dir):
+            sbin_names.update(os.listdir(sbin_dir))
+        for cmd in sorted(sbin_names):
+            src = os.path.join(sbin_dir, cmd)
+            if not os.path.isfile(src):
+                continue
+            dst = f"/usr/local/bin/{cmd}"
+            if os.path.islink(dst) and os.path.realpath(dst) == os.path.realpath(src):
+                continue
+            self._sudo_ln(src, dst, cmd)
 
     def _ensure_hadoop_on_path(self) -> bool:
         hadoop_home = _resolve_hadoop_home()
@@ -265,8 +243,14 @@ class StateDetector:
         if hadoop_home + "/bin" not in os.environ.get("PATH", ""):
             os.environ["PATH"] = f"{hadoop_home}/bin:{hadoop_home}/sbin:{os.environ.get('PATH','')}"
             logger.info(f"Auto-set HADOOP_HOME={hadoop_home} and updated PATH")
-        self._write_profile_d(hadoop_home, java_home)
-        self._create_bin_symlinks(hadoop_home)
+
+        # Only write profile_d + symlinks once per process — not every iteration
+        marker = getattr(self, "_profile_written", None)
+        if marker != hadoop_home:
+            self._write_profile_d(hadoop_home, java_home)
+            self._create_bin_symlinks(hadoop_home)
+            self._profile_written = hadoop_home
+
         return shutil.which("hadoop") is not None
 
     def _check_hadoop(self) -> bool:
@@ -365,6 +349,14 @@ class StateDetector:
     # ── logs ──────────────────────────────────────────────────────────────────
 
     def _check_log_errors(self) -> bool:
+        # If NameNode is already up, old errors in logs are stale — ignore them
+        try:
+            jps_out = subprocess.run(["jps"], capture_output=True, text=True, timeout=5).stdout
+            if "NameNode" in jps_out and "DataNode" in jps_out:
+                return False
+        except Exception:
+            pass
+
         hadoop_home = _resolve_hadoop_home()
         log_dirs = [os.path.join(hadoop_home, "logs"),
                     os.environ.get("HADOOP_LOG_DIR", "")]
