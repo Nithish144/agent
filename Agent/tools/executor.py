@@ -189,7 +189,17 @@ class ToolExecutor:
                 )
             else:
                 new_env = existing_env.rstrip() + "\n" + env_line + "\n"
-            open(env_file, "w").write(new_env)
+            if os.getuid() == 0:
+                open(env_file, "w").write(new_env)
+            else:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False)
+                tmp.write(new_env)
+                tmp.flush()
+                tmp.close()
+                subprocess.run(["sudo", "-n", "cp", tmp.name, env_file], check=True)
+                subprocess.run(["sudo", "-n", "chmod", "644", env_file], check=True)
+                os.unlink(tmp.name)
             logger.info(f"Wrote /etc/environment with Hadoop PATH")
         except Exception as e:
             logger.warning(f"Could not write /etc/environment: {e}")
@@ -205,10 +215,14 @@ class ToolExecutor:
                 src = os.path.join(src_dir, fname)
                 dst = os.path.join("/usr/local/bin", fname)
                 try:
-                    if os.path.islink(dst) or os.path.exists(dst):
-                        os.remove(dst)
-                    os.symlink(src, dst)
-                    logger.info(f"Symlinked {fname} -> /usr/local/bin/")
+                    # Use sudo ln -sfn — works for both root and non-root users
+                    r = subprocess.run(
+                        self._sudo(["ln", "-sfn", src, dst]),
+                        capture_output=True, text=True, timeout=10)
+                    if r.returncode == 0:
+                        logger.info(f"Symlinked {fname} -> /usr/local/bin/")
+                    else:
+                        logger.warning(f"Could not symlink {fname}: {r.stderr.strip()}")
                 except Exception as e:
                     logger.warning(f"Could not symlink {fname}: {e}")
 
